@@ -78,9 +78,19 @@ def spew(context):
     context.log.info('HELLO WORLD')
 
 
+@solid
+def fail(context):
+    raise Exception('I AM SUPPOSED TO FAIL')
+
+
 @pipeline
 def stdout_pipeline():
     spew()
+
+
+@pipeline
+def stderr_pipeline():
+    fail()
 
 
 def test_list_command():
@@ -440,6 +450,14 @@ def test_stdout_execute_command():
         runner, ['-f', script_relative_path('test_cli_commands.py'), '-n', 'stdout_pipeline']
     )
     assert 'HELLO WORLD' in result.output
+
+
+def test_stderr_execute_command():
+    runner = CliRunner()
+    result = runner_pipeline_execute(
+        runner, ['-f', script_relative_path('test_cli_commands.py'), '-n', 'stderr_pipeline']
+    )
+    assert 'I AM SUPPOSED TO FAIL' in result.output
 
 
 def test_fn_not_found_execute():

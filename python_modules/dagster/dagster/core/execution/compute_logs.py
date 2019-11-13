@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dagster import check
 from dagster.core.execution.context.system import SystemStepExecutionContext
 from dagster.core.storage.compute_log_manager import ComputeIOType
+from dagster.seven import IS_WINDOWS
 from dagster.utils import ensure_file
 
 WIN_PY36_COMPUTE_LOG_DISABLED_MSG = '''\u001b[33mWARNING: Compute log capture is disabled for the current environment. Set the environment variable `PYTHONLEGACYWINDOWSSTDIO` to enable.\n\u001b[0m'''
@@ -101,69 +102,74 @@ POLLING_INTERVAL = 0.1
 
 @contextmanager
 def tailf(path, io_type=ComputeIOType.STDOUT):
-    if should_compute_log_tail_poll():
-        # windows
+    if IS_WINDOWS:
+        with execute_windows_tail(path, io_type):
+            yield
+    else:
+        with execute_posix_tail(path, io_type):
+            yield
 
-        # Cannot use multiprocessing here because we already may be in a daemonized process
-        # Instead, invoke a thin wrapper around tail_polling using the dagster cli
-        cmd = '{} -m dagster utils tail {} --parent-pid {} --io-type {}'.format(
-            sys.executable, path, os.getpid(), io_type
-        ).split(' ')
-        tail_process = subprocess.Popen(cmd)
 
+@contextmanager
+def execute_windows_tail(path, io_type):
+    # Cannot use multiprocessing here because we already may be in a daemonized process
+    # Instead, invoke a thin wrapper around tail_polling using the dagster cli
+    cmd = '{} -m dagster utils tail {} --parent-pid {} --io-type {}'.format(
+        sys.executable, path, os.getpid(), io_type
+    ).split(' ')
+    tail_process = subprocess.Popen(cmd)
+
+    try:
+        yield
+    finally:
+        if tail_process:
+            time.sleep(2 * POLLING_INTERVAL)
+            tail_process.terminate()
+
+
+@contextmanager
+def execute_posix_tail(path, io_type):
+    cmd = 'tail -F -c +0 {}'.format(path).split(' ')
+
+    # open a subprocess to tail the file and print to stdout
+    stream = sys.stdout if io_type == ComputeIOType.STDOUT else sys.stderr
+    stream = stream if _fileno(stream) else None
+    tail_process = subprocess.Popen(cmd, stdout=stream)
+
+    # fork a child watcher process to sleep/wait for the parent process (which yields to the
+    # compute function) to either A) complete and clean-up OR B) segfault / die silently.  In
+    # the case of B, the spawned tail process will not automatically get terminated, so we need
+    # to make sure that we terminate it explicitly and then exit.
+    watcher_pid = os.fork()
+
+    def clean(*_args):
+        try:
+            if tail_process:
+                tail_process.terminate()
+        except OSError:
+            pass
+        try:
+            if watcher_pid:
+                os.kill(watcher_pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    if watcher_pid == 0:
+        # this is the child watcher process, sleep until orphaned, then kill the tail process
+        # and exit
+        while True:
+            if os.getppid() == 1:  # orphaned process
+                clean()
+                os._exit(0)  # pylint: disable=W0212
+            else:
+                time.sleep(1)
+    else:
+        # this is the parent process, yield to the compute function and then terminate both the
+        # tail and watcher processes.
         try:
             yield
         finally:
-            if tail_process:
-                time.sleep(0.5)
-                tail_process.terminate()
-
-    else:
-        cmd = 'tail -F -c +0 {}'.format(path).split(' ')
-
-        # open a subprocess to tail the file and print to stdout
-        stream = sys.stdout if io_type == ComputeIOType.STDOUT else sys.stderr
-        stream = stream if _fileno(stream) else None
-        tail_process = subprocess.Popen(cmd, stdout=stream)
-
-        # fork a child watcher process to sleep/wait for the parent process (which yields to the
-        # compute function) to either A) complete and clean-up OR B) segfault / die silently.  In
-        # the case of B, the spawned tail process will not automatically get terminated, so we need
-        # to make sure that we terminate it explicitly and then exit.
-        watcher_pid = os.fork()
-
-        def clean(*_args):
-            try:
-                if tail_process:
-                    tail_process.terminate()
-            except OSError:
-                pass
-            try:
-                if watcher_pid:
-                    os.kill(watcher_pid, signal.SIGTERM)
-            except OSError:
-                pass
-
-        if watcher_pid == 0:
-            # this is the child watcher process, sleep until orphaned, then kill the tail process
-            # and exit
-            while True:
-                if os.getppid() == 1:  # orphaned process
-                    clean()
-                    os._exit(0)  # pylint: disable=W0212
-                else:
-                    time.sleep(1)
-        else:
-            # this is the parent process, yield to the compute function and then terminate both the
-            # tail and watcher processes.
-            try:
-                yield
-            finally:
-                clean()
-
-
-def should_compute_log_tail_poll():
-    return sys.platform == 'win32'
+            clean()
 
 
 def tail_polling(filepath, stream=sys.stdout, parent_pid=None):
